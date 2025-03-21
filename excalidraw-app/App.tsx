@@ -24,10 +24,11 @@ import {
   VERSION_TIMEOUT,
 } from "@excalidraw/excalidraw/constants";
 import polyfill from "@excalidraw/excalidraw/polyfill";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { loadFromBlob } from "@excalidraw/excalidraw/data/blob";
 import { useCallbackRefState } from "@excalidraw/excalidraw/hooks/useCallbackRefState";
 import { t } from "@excalidraw/excalidraw/i18n";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   debounce,
   getVersion,
@@ -138,6 +139,7 @@ import { ExcalidrawPlusIframeExport } from "./ExcalidrawPlusIframeExport";
 import "./index.scss";
 
 import type { CollabAPI } from "./collab/Collab";
+import { useScenes, type Scene } from "./components/ScenesManager";
 
 polyfill();
 
@@ -160,17 +162,10 @@ declare global {
 
 let pwaEvent: BeforeInstallPromptEvent | null = null;
 
-// Adding a listener outside of the component as it may (?) need to be
-// subscribed early to catch the event.
-//
-// Also note that it will fire only if certain heuristics are met (user has
-// used the app for some time, etc.)
 window.addEventListener(
   "beforeinstallprompt",
   (event: BeforeInstallPromptEvent) => {
-    // prevent Chrome <= 67 from automatically showing the prompt
     event.preventDefault();
-    // cache for later use
     pwaEvent = event;
   },
 );
@@ -228,11 +223,8 @@ const initializeScene = async (opts: {
   const isExternalScene = !!(id || jsonBackendMatch || roomLinkData);
   if (isExternalScene) {
     if (
-      // don't prompt if scene is empty
       !scene.elements.length ||
-      // don't prompt for collab scenes because we don't override local storage
       roomLinkData ||
-      // otherwise, prompt whether user wants to override current scene
       (await openConfirmModal(shareableLinkConfirmDialog))
     ) {
       if (jsonBackendMatch) {
@@ -247,7 +239,6 @@ const initializeScene = async (opts: {
         window.history.replaceState({}, APP_NAME, window.location.origin);
       }
     } else {
-      // https://github.com/excalidraw/excalidraw/issues/1919
       if (document.hidden) {
         return new Promise((resolve, reject) => {
           window.addEventListener(
@@ -294,21 +285,18 @@ const initializeScene = async (opts: {
     const scene = await opts.collabAPI.startCollaboration(roomLinkData);
 
     return {
-      // when collaborating, the state may have already been updated at this
-      // point (we may have received updates from other clients), so reconcile
-      // elements and appState with existing state
       scene: {
         ...scene,
         appState: {
           ...restoreAppState(
             {
-              ...scene?.appState,
-              theme: localDataState?.appState?.theme || scene?.appState?.theme,
+              ...(scene as { appState?: any })?.appState,
+              theme:
+                localDataState?.appState?.theme ||
+                (scene as { appState?: any })?.appState?.theme,
             },
             excalidrawAPI.getAppState(),
           ),
-          // necessary if we're invoking from a hashchange handler which doesn't
-          // go through App.initializeScene() that resets this flag
           isLoading: false,
         },
         elements: reconcileElements(
@@ -336,18 +324,23 @@ const initializeScene = async (opts: {
 
 const ExcalidrawWrapper = () => {
   const [errorMessage, setErrorMessage] = useState("");
-  const isCollabDisabled = isRunningInIframe();
+
+  // Collaboration feature flag
+  const COLLABORATION_ENABLED =
+    import.meta.env.VITE_APP_DISABLE_COLLABORATION !== "true";
+
+  // Force collaboration to be disabled if the feature flag is off
+  const isCollabDisabled = !COLLABORATION_ENABLED || isRunningInIframe();
 
   const { editorTheme, appTheme, setAppTheme } = useHandleAppTheme();
-
   const [langCode, setLangCode] = useAppLangCode();
 
   // initial state
   // ---------------------------------------------------------------------------
-
   const initialStatePromiseRef = useRef<{
     promise: ResolvablePromise<ExcalidrawInitialDataState | null>;
   }>({ promise: null! });
+
   if (!initialStatePromiseRef.current.promise) {
     initialStatePromiseRef.current.promise =
       resolvablePromise<ExcalidrawInitialDataState | null>();
@@ -376,7 +369,6 @@ const ExcalidrawWrapper = () => {
   useHandleLibrary({
     excalidrawAPI,
     adapter: LibraryIndexedDBAdapter,
-    // TODO maybe remove this in several months (shipped: 24-03-11)
     migrationAdapter: LibraryLocalStorageMigrationAdapter,
   });
 
@@ -462,8 +454,6 @@ const ExcalidrawWrapper = () => {
                 });
               });
           }
-          // on fresh load, clear unused files from IDB (from previous
-          // session)
           LocalData.fileStorage.clearObsoleteFiles({ currentFileIds: fileIds });
         }
       }
@@ -512,7 +502,6 @@ const ExcalidrawWrapper = () => {
         !document.hidden &&
         ((collabAPI && !collabAPI.isCollaborating()) || isCollabDisabled)
       ) {
-        // don't sync if local state is newer or identical to browser state
         if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_DATA_STATE)) {
           const localDataState = importFromLocalStorage();
           const username = importUsernameFromLocalStorage();
@@ -530,7 +519,6 @@ const ExcalidrawWrapper = () => {
           });
           collabAPI?.setUsername(username || "");
         }
-
         if (isBrowserStorageStateNewer(STORAGE_KEYS.VERSION_FILES)) {
           const elements = excalidrawAPI.getSceneElementsIncludingDeleted();
           const currFiles = excalidrawAPI.getFiles();
@@ -538,13 +526,13 @@ const ExcalidrawWrapper = () => {
             elements?.reduce((acc, element) => {
               if (
                 isInitializedImageElement(element) &&
-                // only load and update images that aren't already loaded
                 !currFiles[element.fileId]
               ) {
                 return acc.concat(element.fileId);
               }
               return acc;
             }, [] as FileId[]) || [];
+
           if (fileIds.length) {
             LocalData.fileStorage
               .getFiles(fileIds)
@@ -617,6 +605,19 @@ const ExcalidrawWrapper = () => {
     };
   }, [excalidrawAPI]);
 
+  useEffect(() => {
+    console.log("ExcalidrawWrapper mounted");
+    return () => {
+      console.log("ExcalidrawWrapper unmounted");
+    };
+  }, []);
+
+  useEffect(() => {
+    if (excalidrawAPI) {
+      console.log("excalidrawAPI initialized");
+    }
+  }, [excalidrawAPI]);
+
   const onChange = (
     elements: readonly OrderedExcalidrawElement[],
     appState: AppState,
@@ -626,8 +627,6 @@ const ExcalidrawWrapper = () => {
       collabAPI.syncElements(elements);
     }
 
-    // this check is redundant, but since this is a hot path, it's best
-    // not to evaludate the nested expression every time
     if (!LocalData.isSavePaused()) {
       LocalData.save(elements, appState, files, () => {
         if (excalidrawAPI) {
@@ -658,7 +657,6 @@ const ExcalidrawWrapper = () => {
       });
     }
 
-    // Render the debug scene if the debug canvas is available
     if (debugCanvasRef.current && excalidrawAPI) {
       debugRenderer(
         debugCanvasRef.current,
@@ -669,9 +667,187 @@ const ExcalidrawWrapper = () => {
     }
   };
 
-  const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
-    null,
+  const location = useLocation();
+  const navigate = useNavigate();
+  const sceneIdFromUrl = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    return params.get("scene");
+  }, [location.search]);
+
+  const { scenes, createScene, updateScene } = useScenes();
+
+  const saveCurrentScene = useCallback(
+    async (opts: { name?: string; forceNew?: boolean } = {}) => {
+      if (!excalidrawAPI) {
+        console.error("Cannot save scene: excalidrawAPI is not available");
+        return;
+      }
+
+      try {
+        // Get the current elements and state
+        const elements = excalidrawAPI.getSceneElements() as NonDeletedExcalidrawElement[];
+        const appState = excalidrawAPI.getAppState();
+        
+        console.log("Saving scene:", { 
+          elementsCount: elements.length,
+          forceNew: opts.forceNew,
+          currentSceneId: sceneIdFromUrl
+        });
+        
+        // Generate thumbnail
+        const thumbnailCanvas = document.createElement("canvas");
+        thumbnailCanvas.width = 200;
+        thumbnailCanvas.height = 150;
+        const ctx = thumbnailCanvas.getContext("2d");
+        
+        if (ctx) {
+          ctx.fillStyle = appState.viewBackgroundColor;
+          ctx.fillRect(0, 0, thumbnailCanvas.width, thumbnailCanvas.height);
+          
+          // Scale down the scene to fit in the thumbnail
+          const scale = Math.min(
+            thumbnailCanvas.width / appState.width,
+            thumbnailCanvas.height / appState.height
+          ) * 0.8;
+          
+          ctx.translate(thumbnailCanvas.width / 2, thumbnailCanvas.height / 2);
+          ctx.scale(scale, scale);
+          ctx.translate(-appState.scrollX - appState.width / 2, -appState.scrollY - appState.height / 2);
+          
+          // Draw a representation of the elements
+          if (elements.length > 0) {
+            elements.forEach(element => {
+              ctx.fillStyle = "rgba(0, 0, 0, 0.2)";
+              const width = element.width || 100;
+              const height = element.height || 100;
+              const x = element.x || 0;
+              const y = element.y || 0;
+              ctx.fillRect(x, y, width, height);
+            });
+          } else {
+            // If no elements, just draw a placeholder
+            ctx.fillStyle = "rgba(0, 0, 0, 0.1)";
+            ctx.fillRect(-100, -100, 200, 200);
+          }
+        }
+        
+        const thumbnailDataUrl = thumbnailCanvas.toDataURL();
+
+        // Make deep copies of elements and appState to avoid reference issues
+        const elementsCopy = JSON.parse(JSON.stringify(elements));
+        const appStateCopy = JSON.parse(JSON.stringify({
+          ...appState,
+          // Remove any properties that might cause issues when reloading
+          collaborators: undefined,
+          contextMenu: null,
+          draggingElement: null,
+          editingElement: null,
+          editingLinearElement: null,
+          resizingElement: null,
+          selectedElementIds: {},
+          selectedGroupIds: {},
+        }));
+
+        let sceneId: string | undefined;
+        
+        if (sceneIdFromUrl && !opts.forceNew) {
+          // Update existing scene
+          updateScene(sceneIdFromUrl, elementsCopy, appStateCopy, thumbnailDataUrl);
+          sceneId = sceneIdFromUrl;
+          console.log("Updated existing scene:", sceneId);
+        } else {
+          // Create new scene
+          const scene = createScene(
+            opts.name || "Untitled Scene",
+            elementsCopy,
+            appStateCopy,
+            thumbnailDataUrl,
+          );
+          sceneId = scene.id;
+          console.log("Created new scene:", sceneId);
+        }
+        
+        return sceneId;
+      } catch (error) {
+        console.error("Error saving scene:", error);
+        return undefined;
+      }
+    },
+    [excalidrawAPI, sceneIdFromUrl, createScene, updateScene],
   );
+  
+  const loadScene = useCallback(
+    (sceneId: string) => {
+      const scene = scenes.find((s) => s.id === sceneId);
+      if (!scene || !excalidrawAPI) {
+        console.error("Failed to load scene:", { sceneId, scenesCount: scenes.length });
+        return;
+      }
+      
+      console.log("Loading scene:", { 
+        id: scene.id, 
+        name: scene.name, 
+        elementsCount: scene.elements.length 
+      });
+      
+      // Make sure we have valid elements
+      if (!scene.elements || !Array.isArray(scene.elements) || scene.elements.length === 0) {
+        console.error("Scene has no elements or invalid elements array");
+        return;
+      }
+      
+      try {
+        excalidrawAPI.updateScene({
+          elements: scene.elements,
+          appState: {
+            ...excalidrawAPI.getAppState(),
+            ...scene.appState,
+            contextMenu: null,
+          },
+        });
+        
+        // Update URL with scene ID
+        navigate(`/?scene=${sceneId}`, { replace: true });
+        console.log("Scene loaded successfully");
+      } catch (error) {
+        console.error("Error loading scene:", error);
+      }
+    },
+    [scenes, excalidrawAPI, navigate],
+  );
+  
+  // Load scene from URL when component mounts or when URL changes
+  useEffect(() => {
+    if (sceneIdFromUrl && excalidrawAPI) {
+      console.log("Loading scene from URL:", sceneIdFromUrl);
+      loadScene(sceneIdFromUrl);
+    }
+  }, [sceneIdFromUrl, excalidrawAPI, loadScene]);
+
+  const handleScenesButtonClick = useCallback(async () => {
+    try {
+      console.log("Saving current scene before navigating to scenes page");
+      const sceneId = await saveCurrentScene();
+      
+      if (sceneId) {
+        console.log("Navigating to scenes page with current scene:", sceneId);
+        navigate(`/scenes?current=${sceneId}`);
+      } else {
+        console.log("No scene ID returned, navigating to scenes page without current scene");
+        navigate("/scenes");
+      }
+    } catch (error) {
+      console.error("Error navigating to scenes page:", error);
+      // Navigate anyway, even if there was an error
+      navigate("/scenes");
+    }
+  }, [saveCurrentScene, navigate]);
+
+  useEffect(() => {
+    if (sceneIdFromUrl && excalidrawAPI) {
+      loadScene(sceneIdFromUrl);
+    }
+  }, [sceneIdFromUrl, excalidrawAPI, loadScene]);
 
   const onExportToBackend = async (
     exportedElements: readonly NonDeletedExcalidrawElement[],
@@ -733,9 +909,64 @@ const ExcalidrawWrapper = () => {
     [setShareDialogState],
   );
 
-  // browsers generally prevent infinite self-embedding, there are
-  // cases where it still happens, and while we disallow self-embedding
-  // by not whitelisting our own origin, this serves as an additional guard
+  const renderTopRightUI = useCallback(() => {
+    return (
+      <div className="top-right-ui">
+        <button
+          className="home-button"
+          onClick={handleScenesButtonClick}
+          title="View all scenes"
+        >
+          <svg
+            width="24"
+            height="24"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+            <polyline points="9 22 9 12 15 12 15 22" />
+          </svg>
+        </button>
+        <style>{`
+          .top-right-ui {
+            position: absolute;
+            top: 1rem;
+            right: 1rem;
+            z-index: 100;
+          }
+          
+          .home-button {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 40px;
+            height: 40px;
+            background: var(--color-primary);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, background 0.2s;
+            cursor: pointer;
+          }
+          
+          .home-button:hover {
+            transform: translateY(-2px);
+            background: var(--color-primary-darker);
+          }
+        `}</style>
+      </div>
+    );
+  }, [handleScenesButtonClick]);
+
+  const [latestShareableLink, setLatestShareableLink] = useState<string | null>(
+    null,
+  );
+
   if (isSelfEmbedding) {
     return (
       <div
@@ -842,22 +1073,7 @@ const ExcalidrawWrapper = () => {
         handleKeyboardGlobally={true}
         autoFocus={true}
         theme={editorTheme}
-        renderTopRightUI={(isMobile) => {
-          if (isMobile || !collabAPI || isCollabDisabled) {
-            return null;
-          }
-          return (
-            <div className="top-right-ui">
-              {collabError.message && <CollabError collabError={collabError} />}
-              <LiveCollaborationTrigger
-                isCollaborating={isCollaborating}
-                onSelect={() =>
-                  setShareDialogState({ isOpen: true, type: "share" })
-                }
-              />
-            </div>
-          );
-        }}
+        renderTopRightUI={renderTopRightUI}
         onLinkOpen={(element, event) => {
           if (element.link && isElementLink(element.link)) {
             event.preventDefault();
@@ -1120,8 +1336,6 @@ const ExcalidrawWrapper = () => {
                 if (pwaEvent) {
                   pwaEvent.prompt();
                   pwaEvent.userChoice.then(() => {
-                    // event cannot be reused, but we'll hopefully
-                    // grab new one as the event should be fired again
                     pwaEvent = null;
                   });
                 }
